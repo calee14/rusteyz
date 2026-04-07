@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 rdev = "0.5.3"
+rodio = "0.22.2"
