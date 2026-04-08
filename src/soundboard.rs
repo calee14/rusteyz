@@ -8,9 +8,9 @@ use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source};
 use std::{collections::VecDeque, fs, io::Cursor, ops::Deref, sync::Arc};
 
 enum HotKeyEvent {
-    MUTE,
-    VOLUME_UP,
-    VOLUME_DOWN,
+    Mute,
+    VolumeUp,
+    VolumeDown,
 }
 
 struct HotKeyListener {
@@ -51,12 +51,14 @@ impl HotKeyListener {
             return None;
         }
 
+        self.leader = false;
+
         // Check if events are detected
         let last_key = self.buffer.back().unwrap();
         match last_key {
-            Key::KeyM => Some(HotKeyEvent::MUTE),
-            Key::KeyJ => Some(HotKeyEvent::VOLUME_DOWN),
-            Key::KeyK => Some(HotKeyEvent::VOLUME_UP),
+            Key::KeyM => Some(HotKeyEvent::Mute),
+            Key::KeyJ => Some(HotKeyEvent::VolumeDown),
+            Key::KeyK => Some(HotKeyEvent::VolumeUp),
             _ => None,
         }
     }
@@ -67,6 +69,8 @@ pub struct SoundBoard {
     is_muted: bool,
     press_sound: Arc<Vec<u8>>,
     release_sound: Arc<Vec<u8>>,
+    spacebar_press_sound: Arc<Vec<u8>>,
+    spacebar_release_sound: Arc<Vec<u8>>,
     handle: MixerDeviceSink,
     hot_key_listner: HotKeyListener,
     last_key: Option<Key>,
@@ -81,14 +85,24 @@ impl SoundBoard {
             fs::read("assets/milky_yellow_release.wav").expect("failed to read sound file"),
         );
 
+        // Preload keyboard spacebar click sound
+        let spacebar_press_bytes: Arc<Vec<u8>> = Arc::new(
+            fs::read("assets/milky_yellow_space_press.wav").expect("failed to read sound file"),
+        );
+        let spacebar_release_bytes: Arc<Vec<u8>> = Arc::new(
+            fs::read("assets/milky_yellow_space_release.wav").expect("failed to read sound file"),
+        );
+
         // Keep audio sink alive
         let handle = DeviceSinkBuilder::open_default_sink().expect("open default audio device");
 
         Self {
-            volume: 1.0,
+            volume: 0.3,
             is_muted: false,
             press_sound: press_bytes,
             release_sound: release_bytes,
+            spacebar_press_sound: spacebar_press_bytes,
+            spacebar_release_sound: spacebar_release_bytes,
             handle,
             hot_key_listner: HotKeyListener::new(3),
             last_key: None,
@@ -98,10 +112,17 @@ impl SoundBoard {
     pub fn start(mut self) {
         let press_sound = self.press_sound;
         let release_sound = self.release_sound;
+        let spacebar_press_sound = self.spacebar_press_sound;
+        let spacebar_release_sound = self.spacebar_release_sound;
+
         let handle = self.handle;
         if let Err(error) = listen(move |event: Event| {
             // A key was pressed. Play sound
             if let EventType::KeyPress(key) = event.event_type {
+                let mut sound_to_play = press_sound.clone();
+                if key == Key::Space {
+                    sound_to_play = spacebar_press_sound.clone();
+                }
                 if self.last_key == Some(key) {
                     return;
                 }
@@ -113,19 +134,19 @@ impl SoundBoard {
                 if let Some(event) = self.hot_key_listner.input_key(key) {
                     println!("There is an event");
                     match event {
-                        HotKeyEvent::MUTE => self.is_muted = !self.is_muted,
-                        HotKeyEvent::VOLUME_UP => {
+                        HotKeyEvent::Mute => self.is_muted = !self.is_muted,
+                        HotKeyEvent::VolumeUp => {
                             self.volume = (self.volume + 0.1).min(2.0);
                             println!("Volume: {:?}", self.volume);
                         }
-                        HotKeyEvent::VOLUME_DOWN => {
+                        HotKeyEvent::VolumeDown => {
                             self.volume = (self.volume - 0.1).max(0.0);
                             println!("Volume: {:?}", self.volume);
                         }
                     }
                 }
 
-                let cursor = Cursor::new(press_sound.as_ref().clone());
+                let cursor = Cursor::new(sound_to_play.as_ref().clone());
                 let source = Decoder::try_from(cursor).unwrap().amplify(0.25);
 
                 if !self.is_muted {
@@ -135,10 +156,14 @@ impl SoundBoard {
                 }
             }
             if let EventType::KeyRelease(key) = event.event_type {
+                let mut sound_to_play = release_sound.clone();
+                if key == Key::Space {
+                    sound_to_play = spacebar_release_sound.clone();
+                }
                 self.last_key = None;
                 println!("Playing sound because {:?} was released", key);
 
-                let cursor = Cursor::new(release_sound.as_ref().clone());
+                let cursor = Cursor::new(sound_to_play.as_ref().clone());
                 let source = Decoder::try_from(cursor).unwrap().amplify(0.25);
 
                 if !self.is_muted {
