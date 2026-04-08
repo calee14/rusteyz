@@ -1,3 +1,5 @@
+mod pitchshift;
+mod softclip;
 mod soundboard;
 
 fn main() {

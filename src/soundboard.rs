@@ -1,20 +1,85 @@
-use std::{fs, io::Cursor, sync::Arc};
+use crate::{
+    pitchshift::{self, PitchShift, SimpleReverb},
+    softclip::SoftClip,
+};
+use rand::RngExt;
+use rdev::{Event, EventType, Key, listen};
+use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source};
+use std::{collections::VecDeque, fs, io::Cursor, ops::Deref, sync::Arc};
 
-use rdev::{Event, EventType, listen};
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink};
+enum HotKeyEvent {
+    MUTE,
+    VOLUME_UP,
+    VOLUME_DOWN,
+}
+
+struct HotKeyListener {
+    pub max_size: usize,
+    leader: bool,
+    buffer: VecDeque<Key>,
+}
+
+impl HotKeyListener {
+    fn new(max_size: usize) -> Self {
+        Self {
+            max_size,
+            leader: false,
+            buffer: VecDeque::new(),
+        }
+    }
+
+    pub fn input_key(&mut self, key: Key) -> Option<HotKeyEvent> {
+        if self.buffer.len() >= self.max_size {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(key);
+
+        self.check_combinations()
+    }
+
+    fn check_combinations(&mut self) -> Option<HotKeyEvent> {
+        // Check if we can activate leader
+        if let Some(last_key) = self.buffer.back() {
+            if matches!(last_key, Key::Alt) {
+                self.leader = true;
+                return None;
+            }
+        }
+
+        // Trigger combos is leader is active
+        if !self.leader {
+            return None;
+        }
+
+        // Check if events are detected
+        let last_key = self.buffer.back().unwrap();
+        match last_key {
+            Key::KeyM => Some(HotKeyEvent::MUTE),
+            Key::KeyJ => Some(HotKeyEvent::VOLUME_DOWN),
+            Key::KeyK => Some(HotKeyEvent::VOLUME_UP),
+            _ => None,
+        }
+    }
+}
 
 pub struct SoundBoard {
     volume: f32,
     is_muted: bool,
-    sound: Arc<Vec<u8>>,
+    press_sound: Arc<Vec<u8>>,
+    release_sound: Arc<Vec<u8>>,
     handle: MixerDeviceSink,
+    hot_key_listner: HotKeyListener,
+    last_key: Option<Key>,
 }
 
 impl SoundBoard {
     pub fn new() -> Self {
         // Preload keyboard click sound
-        let japanese_black_bytes: Arc<Vec<u8>> =
-            Arc::new(fs::read("assets/japanese_black.wav").expect("failed to read sound file"));
+        let press_bytes: Arc<Vec<u8>> =
+            Arc::new(fs::read("assets/milky_yellow_press.wav").expect("failed to read sound file"));
+        let release_bytes: Arc<Vec<u8>> = Arc::new(
+            fs::read("assets/milky_yellow_release.wav").expect("failed to read sound file"),
+        );
 
         // Keep audio sink alive
         let handle = DeviceSinkBuilder::open_default_sink().expect("open default audio device");
@@ -22,23 +87,65 @@ impl SoundBoard {
         Self {
             volume: 1.0,
             is_muted: false,
-            sound: japanese_black_bytes,
+            press_sound: press_bytes,
+            release_sound: release_bytes,
             handle,
+            hot_key_listner: HotKeyListener::new(3),
+            last_key: None,
         }
     }
 
-    pub fn start(self) {
-        let sound = self.sound;
+    pub fn start(mut self) {
+        let press_sound = self.press_sound;
+        let release_sound = self.release_sound;
         let handle = self.handle;
         if let Err(error) = listen(move |event: Event| {
             // A key was pressed. Play sound
             if let EventType::KeyPress(key) = event.event_type {
+                if self.last_key == Some(key) {
+                    return;
+                }
                 println!("Playing sound because {:?} was pressed", key);
 
-                let cursor = Cursor::new(sound.as_ref().clone());
-                let source = Decoder::try_from(cursor).unwrap();
+                self.last_key = Some(key);
 
-                handle.mixer().add(source);
+                // Update hotkey listener
+                if let Some(event) = self.hot_key_listner.input_key(key) {
+                    println!("There is an event");
+                    match event {
+                        HotKeyEvent::MUTE => self.is_muted = !self.is_muted,
+                        HotKeyEvent::VOLUME_UP => {
+                            self.volume = (self.volume + 0.1).min(2.0);
+                            println!("Volume: {:?}", self.volume);
+                        }
+                        HotKeyEvent::VOLUME_DOWN => {
+                            self.volume = (self.volume - 0.1).max(0.0);
+                            println!("Volume: {:?}", self.volume);
+                        }
+                    }
+                }
+
+                let cursor = Cursor::new(press_sound.as_ref().clone());
+                let source = Decoder::try_from(cursor).unwrap().amplify(0.25);
+
+                if !self.is_muted {
+                    handle
+                        .mixer()
+                        .add(SoftClip::new(source.amplify(self.volume)));
+                }
+            }
+            if let EventType::KeyRelease(key) = event.event_type {
+                self.last_key = None;
+                println!("Playing sound because {:?} was released", key);
+
+                let cursor = Cursor::new(release_sound.as_ref().clone());
+                let source = Decoder::try_from(cursor).unwrap().amplify(0.25);
+
+                if !self.is_muted {
+                    handle
+                        .mixer()
+                        .add(SoftClip::new(source.amplify(self.volume)));
+                }
             }
         }) {
             eprintln!("Error: {:?}", error);
