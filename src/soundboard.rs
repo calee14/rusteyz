@@ -5,7 +5,7 @@ use crate::{
 use rand::{Rng, RngExt};
 use rdev::{Event, EventType, Key, listen};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source, buffer::SamplesBuffer};
-use std::{collections::VecDeque, fs, io::Cursor, num::NonZero, sync::Arc};
+use std::{collections::VecDeque, fs, io::Cursor, num::NonZero, sync::Arc, time::Instant};
 
 // ---------------------------------------------------------------------------
 // How many pitch variants to bake per sound at startup.
@@ -134,6 +134,13 @@ impl PreloadedSound {
             samples,
         )
     }
+
+    /// Duration of the longest variant in seconds (for active-sound tracking).
+    fn duration_secs(&self) -> f32 {
+        let max_len = self.variants.iter().map(|v| v.len()).max().unwrap_or(0);
+        let frames = max_len as f32 / self.channels.max(1) as f32;
+        frames / self.sample_rate as f32
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +158,13 @@ pub struct SoundBoard {
     hot_key_listener: HotKeyListener,
     last_key: Option<Key>,
     rng: rand::rngs::ThreadRng,
+    /// Tracks (expiry time) for each currently-playing sound.
+    /// Used to scale volume down when many sounds overlap.
+    active_sounds: Vec<Instant>,
+    press_duration: f32,
+    release_duration: f32,
+    spacebar_press_duration: f32,
+    spacebar_release_duration: f32,
 }
 
 impl SoundBoard {
@@ -176,6 +190,11 @@ impl SoundBoard {
 
         let handle = DeviceSinkBuilder::open_default_sink().expect("open default audio device");
 
+        let press_duration = press.duration_secs();
+        let release_duration = release.duration_secs();
+        let spacebar_press_duration = spacebar_press.duration_secs();
+        let spacebar_release_duration = spacebar_release.duration_secs();
+
         Self {
             volume: 0.3,
             is_muted: false,
@@ -187,7 +206,29 @@ impl SoundBoard {
             hot_key_listener: HotKeyListener::new(3),
             last_key: None,
             rng: rand::rng(),
+            active_sounds: Vec::new(),
+            press_duration,
+            release_duration,
+            spacebar_press_duration,
+            spacebar_release_duration,
         }
+    }
+
+    /// Remove expired sounds and return a gain factor that keeps the summed
+    /// signal roughly constant regardless of how many sounds overlap.
+    /// Uses 1/sqrt(n) scaling — perceptually even and mathematically sound
+    /// for uncorrelated signals.
+    fn overlap_gain(&mut self) -> f32 {
+        let now = Instant::now();
+        self.active_sounds.retain(|&expiry| expiry > now);
+        let n = (self.active_sounds.len() as f32 + 1.0).max(1.0); // +1 for the sound we're about to add
+        1.0 / n.sqrt()
+    }
+
+    /// Register a new sound that will play for `duration` seconds.
+    fn track_sound(&mut self, duration_secs: f32) {
+        let expiry = Instant::now() + std::time::Duration::from_secs_f32(duration_secs);
+        self.active_sounds.push(expiry);
     }
 
     pub fn start(mut self) {
@@ -221,15 +262,25 @@ impl SoundBoard {
                     return;
                 }
 
-                // Pick the right sound pool and grab a pre-baked variant
-                let sound = if key == Key::Space {
+                // Grab the duration (Copy) without borrowing self for long
+                let (is_space, dur) = if key == Key::Space {
+                    (true, self.spacebar_press_duration)
+                } else {
+                    (false, self.press_duration)
+                };
+
+                // Mutable work first — no outstanding borrows on self
+                let gain = self.overlap_gain();
+                self.track_sound(dur);
+                let vol = self.volume * 0.25 * gain;
+
+                // Now borrow the sound and rng; the borrow lives only for this line
+                let sound = if is_space {
                     &self.spacebar_press
                 } else {
                     &self.press
                 };
-
-                // Volume is baked into the buffer; SoftClip just prevents clipping
-                let buf = sound.random_buffer(&mut self.rng, self.volume * 0.25);
+                let buf = sound.random_buffer(&mut self.rng, vol);
                 self.handle.mixer().add(SoftClip::new(buf));
             }
 
@@ -240,13 +291,22 @@ impl SoundBoard {
                     return;
                 }
 
-                let sound = if key == Key::Space {
+                let (is_space, dur) = if key == Key::Space {
+                    (true, self.spacebar_release_duration)
+                } else {
+                    (false, self.release_duration)
+                };
+
+                let gain = self.overlap_gain();
+                self.track_sound(dur);
+                let vol = self.volume * 0.25 * gain;
+
+                let sound = if is_space {
                     &self.spacebar_release
                 } else {
                     &self.release
                 };
-
-                let buf = sound.random_buffer(&mut self.rng, self.volume * 0.25);
+                let buf = sound.random_buffer(&mut self.rng, vol);
                 self.handle.mixer().add(SoftClip::new(buf));
             }
         }) {
